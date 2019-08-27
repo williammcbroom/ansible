@@ -30,10 +30,6 @@ description:
 - Be carefull when marking a language as trusted since this could be a potential
   security breach. Untrusted languages allow only users with the PostgreSQL superuser
   privilege to use this language to create new functions.
-- For more information about PostgreSQL languages see the official documentation
-  U(https://www.postgresql.org/docs/current/sql-createlanguage.html),
-  U(https://www.postgresql.org/docs/current/sql-alterlanguage.html),
-  U(https://www.postgresql.org/docs/current/sql-droplanguage.html).
 version_added: '1.7'
 options:
   lang:
@@ -73,26 +69,6 @@ options:
     - Only used when C(state=absent).
     type: bool
     default: 'no'
-  port:
-    description:
-    - Database port to connect to.
-    default: 5432
-    type: int
-    aliases:
-    - login_port
-  login_user:
-    description:
-    - User to authenticate with PostgreSQL.
-    type: str
-    default: postgres
-  login_password:
-    description:
-    - Password used to authenticate with PostgreSQL (must match C(login_user)).
-    type: str
-  login_host:
-    description:
-    - Host running PostgreSQL where you want to execute the actions.
-    type: str
   session_role:
     version_added: '2.8'
     description:
@@ -108,43 +84,42 @@ options:
     choices: [ absent, present ]
   login_unix_socket:
     description:
-    - Path to a Unix domain socket for local connections.
+      - Path to a Unix domain socket for local connections.
     type: str
     version_added: '2.8'
   ssl_mode:
     description:
-    - Determines whether or with what priority a secure SSL TCP/IP connection
-      will be negotiated with the server.
-    - See U(https://www.postgresql.org/docs/current/static/libpq-ssl.html) for
-      more information on the modes.
-    - Default of C(prefer) matches libpq default.
+      - Determines whether or with what priority a secure SSL TCP/IP connection will be negotiated with the server.
+      - See https://www.postgresql.org/docs/current/static/libpq-ssl.html for more information on the modes.
+      - Default of C(prefer) matches libpq default.
     type: str
     default: prefer
     choices: [ allow, disable, prefer, require, verify-ca, verify-full ]
     version_added: '2.8'
   ca_cert:
     description:
-    - Specifies the name of a file containing SSL certificate authority (CA)
-      certificate(s). If the file exists, the server's certificate will be
-      verified to be signed by one of these authorities.
+      - Specifies the name of a file containing SSL certificate authority (CA) certificate(s).
+      - If the file exists, the server's certificate will be verified to be signed by one of these authorities.
     type: str
-    version_added: '2.8'
     aliases: [ ssl_rootcert ]
-
-notes:
-- The default authentication assumes that you are either logging in as or
-  sudo'ing to the postgres account on the host.
-- This module uses psycopg2, a Python PostgreSQL database adapter. You must
-  ensure that psycopg2 is installed on the host before using this module.
-- If the remote host is the PostgreSQL server (which is the default case), then
-  PostgreSQL must also be installed on the remote host.
-- For Ubuntu-based systems, install the postgresql, libpq-dev, and python-psycopg2 packages
-  on the remote host before using this module.
-requirements: [ psycopg2 ]
-
+    version_added: '2.8'
+seealso:
+- name: PostgreSQL languages
+  description: General information about PostgreSQL languages.
+  link: https://www.postgresql.org/docs/current/xplang.html
+- name: CREATE LANGUAGE reference
+  description: Complete reference of the CREATE LANGUAGE command documentation.
+  link: https://www.postgresql.org/docs/current/sql-createlanguage.html
+- name: ALTER LANGUAGE reference
+  description: Complete reference of the ALTER LANGUAGE command documentation.
+  link: https://www.postgresql.org/docs/current/sql-alterlanguage.html
+- name: DROP LANGUAGE reference
+  description: Complete reference of the DROP LANGUAGE command documentation.
+  link: https://www.postgresql.org/docs/current/sql-droplanguage.html
 author:
 - Jens Depuydt (@jensdepuydt)
 - Thomas O'Donnell (@andytom)
+extends_documentation_fragment: postgres
 '''
 
 EXAMPLES = r'''
@@ -192,21 +167,12 @@ queries:
   version_added: '2.8'
 '''
 
-import traceback
-
-PSYCOPG2_IMP_ERR = None
-try:
-    import psycopg2
-    postgresqldb_found = True
-except ImportError:
-    PSYCOPG2_IMP_ERR = traceback.format_exc()
-    postgresqldb_found = False
-
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
-from ansible.module_utils.postgres import postgres_common_argument_spec
-from ansible.module_utils.six import iteritems
-from ansible.module_utils._text import to_native
-from ansible.module_utils.database import pg_quote_identifier
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.postgres import (
+    connect_to_db,
+    get_conn_params,
+    postgres_common_argument_spec,
+)
 
 executed_queries = []
 
@@ -287,52 +253,10 @@ def main():
     force_trust = module.params["force_trust"]
     cascade = module.params["cascade"]
     fail_on_drop = module.params["fail_on_drop"]
-    sslrootcert = module.params["ca_cert"]
-    session_role = module.params["session_role"]
 
-    if not postgresqldb_found:
-        module.fail_json(msg=missing_required_lib('psycopg2'), exception=PSYCOPG2_IMP_ERR)
-
-    # To use defaults values, keyword arguments must be absent, so
-    # check which values are empty and don't include in the **kw
-    # dictionary
-    params_map = {
-        "login_host": "host",
-        "login_user": "user",
-        "login_password": "password",
-        "port": "port",
-        "db": "database",
-        "ssl_mode": "sslmode",
-        "ca_cert": "sslrootcert"
-    }
-    kw = dict((params_map[k], v) for (k, v) in iteritems(module.params)
-              if k in params_map and v != "" and v is not None)
-
-    # If a login_unix_socket is specified, incorporate it here.
-    is_localhost = "host" not in kw or kw["host"] == "" or kw["host"] == "localhost"
-    if is_localhost and module.params["login_unix_socket"] != "":
-        kw["host"] = module.params["login_unix_socket"]
-
-    if psycopg2.__version__ < '2.4.3' and sslrootcert is not None:
-        module.fail_json(msg='psycopg2 must be at least 2.4.3 in order to user the ca_cert parameter')
-
-    try:
-        db_connection = psycopg2.connect(**kw)
-        cursor = db_connection.cursor()
-
-    except TypeError as e:
-        if 'sslrootcert' in e.args[0]:
-            module.fail_json(msg='Postgresql server must be at least version 8.4 to support sslrootcert')
-        module.fail_json(msg="unable to connect to database: %s" % to_native(e), exception=traceback.format_exc())
-
-    except Exception as e:
-        module.fail_json(msg="unable to connect to database: %s" % to_native(e), exception=traceback.format_exc())
-
-    if session_role:
-        try:
-            cursor.execute('SET ROLE %s' % pg_quote_identifier(session_role, 'role'))
-        except Exception as e:
-            module.fail_json(msg="Could not switch role: %s" % to_native(e), exception=traceback.format_exc())
+    conn_params = get_conn_params(module, module.params)
+    db_connection = connect_to_db(module, conn_params, autocommit=False)
+    cursor = db_connection.cursor()
 
     changed = False
     kw = {'db': db, 'lang': lang, 'trust': trust}
@@ -373,6 +297,7 @@ def main():
 
     kw['changed'] = changed
     kw['queries'] = executed_queries
+    db_connection.close()
     module.exit_json(**kw)
 
 

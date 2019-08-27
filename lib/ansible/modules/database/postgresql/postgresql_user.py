@@ -70,30 +70,6 @@ options:
     type: bool
     aliases:
     - fail_on_role
-  port:
-    description:
-    - Database port to connect to.
-    type: int
-    default: 5432
-    aliases:
-    - login_port
-  login_user:
-    description:
-    - User (role) used to authenticate with PostgreSQL.
-    type: str
-    default: postgres
-  login_password:
-    description:
-    - Password for U(login_user) used to authenticate with PostgreSQL.
-    type: str
-  login_host:
-    description:
-    - Host running PostgreSQL.
-    type: str
-  login_unix_socket:
-    description:
-    - Path to a Unix domain socket for local connections.
-    type: str
   priv:
     description:
     - "Slash-separated PostgreSQL privileges string: C(priv1/priv2), where
@@ -150,50 +126,40 @@ options:
     default: 'no'
     type: bool
     version_added: '2.0'
-  ssl_mode:
-    description:
-    - Determines whether or with what priority a secure SSL TCP/IP connection
-      will be negotiated with the server.
-    - See U(https://www.postgresql.org/docs/current/static/libpq-ssl.html) for
-      more information on the modes.
-    - Default of C(prefer) matches libpq default.
-    default: prefer
-    choices: [ allow, disable, prefer, require, verify-ca, verify-full ]
-    version_added: '2.3'
-  ca_cert:
-    description:
-    - Specifies the name of a file containing SSL certificate authority (CA)
-      certificate(s). If the file exists, the server's certificate will be
-      verified to be signed by one of these authorities.
-    type: str
-    version_added: '2.3'
-    aliases: [ ssl_rootcert ]
   conn_limit:
     description:
     - Specifies the user (role) connection limit.
     type: int
     version_added: '2.4'
-
+  ssl_mode:
+    description:
+      - Determines whether or with what priority a secure SSL TCP/IP connection will be negotiated with the server.
+      - See https://www.postgresql.org/docs/current/static/libpq-ssl.html for more information on the modes.
+      - Default of C(prefer) matches libpq default.
+    type: str
+    default: prefer
+    choices: [ allow, disable, prefer, require, verify-ca, verify-full ]
+    version_added: '2.3'
+  ca_cert:
+    description:
+      - Specifies the name of a file containing SSL certificate authority (CA) certificate(s).
+      - If the file exists, the server's certificate will be verified to be signed by one of these authorities.
+    type: str
+    aliases: [ ssl_rootcert ]
+    version_added: '2.3'
+  groups:
+    description:
+    - The list of groups (roles) that need to be granted to the user.
+    type: list
+    version_added: '2.9'
 notes:
 - The module creates a user (role) with login privilege by default.
   Use NOLOGIN role_attr_flags to change this behaviour.
-- The default authentication assumes that you are either logging in as or
-  sudo'ing to the postgres account on the host.
-- This module uses psycopg2, a Python PostgreSQL database adapter. You must
-  ensure that psycopg2 is installed on the host before using this module. If
-  the remote host is the PostgreSQL server (which is the default case), then
-  PostgreSQL must also be installed on the remote host. For Ubuntu-based
-  systems, install the postgresql, libpq-dev, and python-psycopg2 packages
-  on the remote host before using this module.
 - If you specify PUBLIC as the user (role), then the privilege changes will apply to all users (roles).
   You may not specify password or role_attr_flags when the PUBLIC user is specified.
-- The ca_cert parameter requires at least Postgres version 8.4 and I(psycopg2) version 2.4.3.
-
-requirements:
-- psycopg2
-
 author:
 - Ansible Core Team
+extends_documentation_fragment: postgres
 '''
 
 EXAMPLES = r'''
@@ -244,6 +210,13 @@ EXAMPLES = r'''
     db: test
     user: test
     password: ""
+
+- name: Create user test and grant group user_ro and user_rw to it
+  postgresql_user:
+    name: test
+    groups:
+    - user_ro
+    - user_rw
 '''
 
 RETURN = r'''
@@ -260,18 +233,22 @@ import re
 import traceback
 from hashlib import md5
 
-PSYCOPG2_IMP_ERR = None
 try:
     import psycopg2
-    import psycopg2.extras
-    HAS_PSYCOPG2 = True
+    from psycopg2.extras import DictCursor
 except ImportError:
-    PSYCOPG2_IMP_ERR = traceback.format_exc()
-    HAS_PSYCOPG2 = False
+    # psycopg2 is checked by connect_to_db()
+    # from ansible.module_utils.postgres
+    pass
 
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.database import pg_quote_identifier, SQLParseError
-from ansible.module_utils.postgres import postgres_common_argument_spec
+from ansible.module_utils.postgres import (
+    connect_to_db,
+    exec_sql,
+    get_conn_params,
+    postgres_common_argument_spec,
+)
 from ansible.module_utils._text import to_bytes, to_native
 from ansible.module_utils.six import iteritems
 
@@ -374,7 +351,7 @@ def user_alter(db_connection, module, user, password, role_attr_flags, encrypted
     """Change user password and/or attributes. Return True if changed, False otherwise."""
     changed = False
 
-    cursor = db_connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor = db_connection.cursor(cursor_factory=DictCursor)
     # Note: role_attr_flags escaped by parse_role_attrs and encrypted is a
     # literal
     if user == 'PUBLIC':
@@ -786,6 +763,91 @@ def get_valid_flags_by_version(cursor):
     ]
 
 
+class PgMembership():
+    def __init__(self, module, cursor, target_roles, groups, fail_on_role=True):
+        self.module = module
+        self.cursor = cursor
+        self.target_roles = [r.strip() for r in target_roles]
+        self.groups = groups
+        self.granted = {}
+        self.fail_on_role = fail_on_role
+        self.non_existent_roles = []
+        self.changed = False
+        self.__check_roles_exist()
+
+    def grant(self):
+        for group in self.groups:
+            self.granted[group] = []
+
+            for role in self.target_roles:
+                # If role is in a group now, pass:
+                if self.__check_membership(group, role):
+                    continue
+
+                query = "GRANT %s TO %s" % ((pg_quote_identifier(group, 'role'),
+                                            (pg_quote_identifier(role, 'role'))))
+                self.changed = exec_sql(self, query, ddl=True, add_to_executed=False)
+                executed_queries.append(query)
+
+                if self.changed:
+                    self.granted[group].append(role)
+
+        return self.changed
+
+    def __check_membership(self, src_role, dst_role):
+        query = ("SELECT ARRAY(SELECT b.rolname FROM "
+                 "pg_catalog.pg_auth_members m "
+                 "JOIN pg_catalog.pg_roles b ON (m.roleid = b.oid) "
+                 "WHERE m.member = r.oid) "
+                 "FROM pg_catalog.pg_roles r "
+                 "WHERE r.rolname = '%s'" % dst_role)
+
+        res = exec_sql(self, query, add_to_executed=False)
+        membership = []
+        if res:
+            membership = res[0][0]
+
+        if not membership:
+            return False
+
+        if src_role in membership:
+            return True
+
+        return False
+
+    def __check_roles_exist(self):
+        for group in self.groups:
+            if not self.__role_exists(group):
+                if self.fail_on_role:
+                    self.module.fail_json(msg="Role %s does not exist" % group)
+                else:
+                    self.module.warn("Role %s does not exist, pass" % group)
+                    self.non_existent_roles.append(group)
+
+        for role in self.target_roles:
+            if not self.__role_exists(role):
+                if self.fail_on_role:
+                    self.module.fail_json(msg="Role %s does not exist" % role)
+                else:
+                    self.module.warn("Role %s does not exist, pass" % role)
+
+                if role not in self.groups:
+                    self.non_existent_roles.append(role)
+
+                else:
+                    if self.fail_on_role:
+                        self.module.exit_json(msg="Role role '%s' is a member of role '%s'" % (role, role))
+                    else:
+                        self.module.warn("Role role '%s' is a member of role '%s', pass" % (role, role))
+
+        # Update role lists, excluding non existent roles:
+        self.groups = [g for g in self.groups if g not in self.non_existent_roles]
+
+        self.target_roles = [r for r in self.target_roles if r not in self.non_existent_roles]
+
+    def __role_exists(self, role):
+        return exec_sql(self, "SELECT 1 FROM pg_roles WHERE rolname = '%s'" % role, add_to_executed=False)
+
 # ===========================================
 # Module execution.
 #
@@ -806,6 +868,7 @@ def main():
         expires=dict(type='str', default=None),
         conn_limit=dict(type='int', default=None),
         session_role=dict(type='str'),
+        groups=dict(type='list'),
     )
     module = AnsibleModule(
         argument_spec=argument_spec,
@@ -816,67 +879,24 @@ def main():
     password = module.params["password"]
     state = module.params["state"]
     fail_on_user = module.params["fail_on_user"]
-    db = module.params["db"]
-    session_role = module.params["session_role"]
-    if db == '' and module.params["priv"] is not None:
+    if module.params['db'] == '' and module.params["priv"] is not None:
         module.fail_json(msg="privileges require a database to be specified")
-    privs = parse_privs(module.params["priv"], db)
+    privs = parse_privs(module.params["priv"], module.params["db"])
     no_password_changes = module.params["no_password_changes"]
     if module.params["encrypted"]:
         encrypted = "ENCRYPTED"
     else:
         encrypted = "UNENCRYPTED"
     expires = module.params["expires"]
-    sslrootcert = module.params["ca_cert"]
     conn_limit = module.params["conn_limit"]
     role_attr_flags = module.params["role_attr_flags"]
+    groups = module.params["groups"]
+    if groups:
+        groups = [e.strip() for e in groups]
 
-    if not HAS_PSYCOPG2:
-        module.fail_json(msg=missing_required_lib('psycopg2'), exception=PSYCOPG2_IMP_ERR)
-
-    # To use defaults values, keyword arguments must be absent, so
-    # check which values are empty and don't include in the **kw
-    # dictionary
-    params_map = {
-        "login_host": "host",
-        "login_user": "user",
-        "login_password": "password",
-        "port": "port",
-        "db": "database",
-        "ssl_mode": "sslmode",
-        "ca_cert": "sslrootcert"
-    }
-    kw = dict((params_map[k], v) for (k, v) in iteritems(module.params)
-              if k in params_map and v != "" and v is not None)
-
-    # If a login_unix_socket is specified, incorporate it here.
-    is_localhost = "host" not in kw or kw["host"] == "" or kw["host"] == "localhost"
-    if is_localhost and module.params["login_unix_socket"] != "":
-        kw["host"] = module.params["login_unix_socket"]
-
-    if psycopg2.__version__ < '2.4.3' and sslrootcert is not None:
-        module.fail_json(
-            msg='psycopg2 must be at least 2.4.3 in order to user the ca_cert parameter')
-
-    try:
-        db_connection = psycopg2.connect(**kw)
-        cursor = db_connection.cursor(
-            cursor_factory=psycopg2.extras.DictCursor)
-
-    except TypeError as e:
-        if 'sslrootcert' in e.args[0]:
-            module.fail_json(
-                msg='Postgresql server must be at least version 8.4 to support sslrootcert')
-        module.fail_json(msg="Unable to connect to database: %s" % to_native(e), exception=traceback.format_exc())
-
-    except Exception as e:
-        module.fail_json(msg="Unable to connect to database: %s" % to_native(e), exception=traceback.format_exc())
-
-    if session_role:
-        try:
-            cursor.execute('SET ROLE %s' % pg_quote_identifier(session_role, 'role'))
-        except Exception as e:
-            module.fail_json(msg="Could not switch role: %s" % to_native(e), exception=traceback.format_exc())
+    conn_params = get_conn_params(module, module.params, warn_db_default=False)
+    db_connection = connect_to_db(module, conn_params)
+    cursor = db_connection.cursor(cursor_factory=DictCursor)
 
     try:
         role_attr_flags = parse_role_attrs(cursor, role_attr_flags)
@@ -908,6 +928,13 @@ def main():
             changed = grant_privileges(cursor, user, privs) or changed
         except SQLParseError as e:
             module.fail_json(msg=to_native(e), exception=traceback.format_exc())
+
+        if groups:
+            target_roles = []
+            target_roles.append(user)
+            pg_membership = PgMembership(module, cursor, target_roles, groups)
+            changed = pg_membership.grant()
+
     else:
         if user_exists(cursor, user):
             if module.check_mode:
